@@ -27,16 +27,29 @@ B) GENUINE -- an ensemble forecast used for every other case, including
        mean log-ratio per hour and the quantiles come from leave-one-out
        residual quantiles per hour, widened by a scale chosen so the
        inner-LOO 90% coverage is closest to 0.90.
-     The two are combined as the geometric mean of their quantiles.
+     * C-local-linear: per hour, a Gaussian-weighted local-linear fit
+       (design [1, z1, z2], ridge 0.1 on slopes only) of log-ratios on
+       standardised (log p1, log(pre24/p1)), bandwidth 1.0; quantiles
+       from kernel-weighted leave-one-out residual quantiles at the
+       target, widened by a scale chosen so the weighted inner-LOO
+       90% coverage is closest to 0.90. Bandwidth/lambda are FIXED at
+       (1.0, 0.1): inner-LOO hyper selection over the 37 practice-kit
+       launches chose bw 1.0 in 32/37 folds and lambda 0.1 in 36/37
+       (see work/analysis/r3/workerE/report.md); re-selecting them at
+       run time would risk the 8 s cap for no measured gain.
+     The three are combined as the geometric mean of their quantiles.
    Honest validation (leave-one-out over the 37 launch comparables in
    the practice kit, same folds for every model):
      house baseline 0.9296 | A-kernel 0.4093 | B-kNN 0.4384
      (B without the early-access feature; with it 0.4183, but that
      feature cannot be derived at run time from case data alone)
-     | ENSEMBLE (this program) 0.3956, coverage_90 0.915,
-     typical miss 75.2%. The ensemble wins overall and on the
-     rolling-midnight subset (0.2559); on the big-p1 subset (p1>=50k)
-     it scores 0.2258 vs 0.2153 for A alone. See README.md.
+     | C-local-linear alone 0.4189 | ENSEMBLE (this program) 0.3808,
+     coverage_90 0.931, typical miss 76.7% (measured through this
+     file's own code; an independent numpy replication in
+     work/analysis/r3/workerE gave 0.3828). The ensemble wins overall
+     and on every subset (p1>=50k 0.2176, p1>=100k 0.2177,
+     console-only 0.2158, rolling-midnight 0.2524); the v1 two-model
+     ensemble scored 0.3956 on the same folds. See README.md.
    Fallbacks (never crash: a crashed case scores as persistence and
    ranks below every all-valid entry): pool >= 5 -> ensemble;
    1 <= pool < 5 -> A-kernel only; pool empty -> embedded unweighted
@@ -59,6 +72,8 @@ HOUSE_Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 KNN_K = 5
 KERNEL_BW = 0.5
 KERNEL_SCALE = 1.25
+LL_BW = 1.0
+LL_LAM = 0.1
 SCALE_GRID = [round(0.5 + 0.05 * i, 2) for i in range(31)]  # 0.50 .. 2.00
 
 # ---------------------------------------------------------------------------
@@ -423,9 +438,113 @@ def predict_knn(p1, feats, pool):
     return out
 
 
+def _inv3(m):
+    """Inverse of a 3x3 matrix by Gauss-Jordan with partial pivoting."""
+    a = [row[:] + [1.0 if i == j else 0.0 for j in range(3)]
+         for i, row in enumerate(m)]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(a[r][col]))
+        if abs(a[piv][col]) < 1e-12:
+            raise ValueError("singular")
+        a[col], a[piv] = a[piv], a[col]
+        d = a[col][col]
+        a[col] = [v / d for v in a[col]]
+        for r in range(3):
+            if r != col and a[r][col] != 0.0:
+                f = a[r][col]
+                a[r] = [v - f * w for v, w in zip(a[r], a[col])]
+    return [row[3:] for row in a]
+
+
+# ---------------------------------------------------------------------------
+# Model C -- local-linear (bw 1.0, ridge 0.1) on standardised
+# (log p1, log(pre24/p1)); median from the weighted local-linear fit,
+# quantiles from kernel-weighted leave-one-out residual quantiles at the
+# target, widened by a coverage-chosen scale. Pure-stdlib port of the
+# numpy implementation in work/analysis/r3/workerE/ll_experiments.py.
+# ---------------------------------------------------------------------------
+def _ll_fit_median(xs, ys, xt):
+    """xs: list of (z1, z2); ys: list of per-hour log-ratio lists;
+    xt: target (z1, z2). Returns the 23-vector median log-ratio."""
+    w = []
+    for (z1, z2) in xs:
+        d2 = (z1 - xt[0]) ** 2 + (z2 - xt[1]) ** 2
+        w.append(math.exp(-0.5 * d2 / (LL_BW * LL_BW)))
+    a = [[0.0] * 3 for _ in range(3)]
+    for k, (z1, z2) in enumerate(xs):
+        row = (1.0, z1, z2)
+        for i in range(3):
+            for j in range(3):
+                a[i][j] += w[k] * row[i] * row[j]
+    a[1][1] += LL_LAM
+    a[2][2] += LL_LAM
+    inv = _inv3(a)
+    med = []
+    for hi in range(len(HOURS)):
+        rhs = [0.0, 0.0, 0.0]
+        for k, (z1, z2) in enumerate(xs):
+            row = (1.0, z1, z2)
+            yv = ys[k][hi]
+            for i in range(3):
+                rhs[i] += w[k] * row[i] * yv
+        beta = [sum(inv[i][j] * rhs[j] for j in range(3)) for i in range(3)]
+        med.append(beta[0] + beta[1] * xt[0] + beta[2] * xt[1])
+    return med, w
+
+
+def predict_local_linear(p1, feats, pool):
+    keys = ["log_p1", "hype24"]
+    stats = _standardize([p["feats"] for p in pool], keys)
+
+    def z(f, k):
+        mu, sd = stats[k]
+        return (f[k] - mu) / sd
+
+    xs = [(z(p["feats"], "log_p1"), z(p["feats"], "hype24")) for p in pool]
+    ys = [p["logratios"] for p in pool]
+    zt = (z(feats, "log_p1"), z(feats, "hype24"))
+    med, w = _ll_fit_median(xs, ys, zt)
+    # Inner leave-one-out residuals (same fit, one launch held out).
+    res = {h: [] for h in HOURS}
+    for j in range(len(pool)):
+        idx = [i for i in range(len(pool)) if i != j]
+        sub_xs = [xs[i] for i in idx]
+        sub_ys = [ys[i] for i in idx]
+        pr, _ = _ll_fit_median(sub_xs, sub_ys, xs[j])
+        for hi, h in enumerate(HOURS):
+            res[h].append(ys[j][hi] - pr[hi])
+    q = {}
+    for hi, h in enumerate(HOURS):
+        q[h] = {tau: _weighted_quantile(res[h], w, tau) for tau in LEVELS}
+    wsum = sum(w)
+    best_s, best_err = 1.0, 1e18
+    for s in SCALE_GRID:
+        wc = 0.0
+        for h in HOURS:
+            lo, hiq = q[h][0.05] * s, q[h][0.95] * s
+            for j, r in enumerate(res[h]):
+                if lo <= r <= hiq:
+                    wc += w[j]
+        err = abs(wc / (wsum * len(HOURS)) - 0.90)
+        if err < best_err:
+            best_err, best_s = err, s
+    out = {}
+    for hi, h in enumerate(HOURS):
+        out[h] = {tau: max(p1 * math.exp(med[hi] + best_s * q[h][tau]), 1.0)
+                  for tau in LEVELS}
+    return out
+
+
 def _ensemble(qa, qb):
     return {h: {tau: math.exp(0.5 * (math.log(qa[h][tau])
                                      + math.log(qb[h][tau])))
+                for tau in LEVELS} for h in HOURS}
+
+
+def _ensemble3(qa, qb, qc):
+    return {h: {tau: math.exp((math.log(qa[h][tau])
+                               + math.log(qb[h][tau])
+                               + math.log(qc[h][tau])) / 3.0)
                 for tau in LEVELS} for h in HOURS}
 
 
@@ -454,8 +573,9 @@ def forecast_case(case):
         pool = build_pool(case)
         feats = target_features(case, p1, ch1)
         if len(pool) >= 5:
-            rows = _ensemble(predict_kernel(p1, feats, pool),
-                             predict_knn(p1, feats, pool))
+            rows = _ensemble3(predict_kernel(p1, feats, pool),
+                              predict_knn(p1, feats, pool),
+                              predict_local_linear(p1, feats, pool))
         elif pool:
             rows = predict_kernel(p1, feats, pool)
         else:

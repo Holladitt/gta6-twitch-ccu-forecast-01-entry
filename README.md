@@ -43,7 +43,14 @@ Fitted at run time from the case's own `comparables`:
   dow-sin, dow-cos]; median = neighbours' mean log-ratio per hour,
   quantiles from leave-one-out residual quantiles per hour, widened by
   a scale chosen for inner-LOO 90% coverage ≈ 0.90.
-- Combined as the geometric mean of the two models' quantiles.
+- **C-local-linear**: per hour, a Gaussian-weighted local-linear fit
+  (design [1, z1, z2], ridge 0.1 on slopes only) of log-ratios on
+  standardised (log p1, log(pre24/p1)), bandwidth 1.0; quantiles from
+  kernel-weighted leave-one-out residual quantiles at the target,
+  widened by a coverage-chosen scale. Bandwidth/lambda are fixed at
+  (1.0, 0.1): inner-LOO hyper selection over the 37 practice-kit
+  launches chose bw 1.0 in 32/37 folds and lambda 0.1 in 36/37.
+- Combined as the geometric mean of the three models' quantiles.
 
 Honest validation — leave-one-out over the 37 launch comparables in
 the practice kit, same folds for every model (mean pinball loss, log
@@ -52,22 +59,27 @@ scale; house baseline on the same folds 0.9296):
 | model | LOO loss | coverage_90 | typical miss |
 |---|---|---|---|
 | A-kernel | 0.4093 | 0.899 | 81.7% |
-| B-kNN (no early-access feature) | 0.4384 | 0.875 | — |
-| **Ensemble (this program)** | **0.3956** | **0.915** | **75.2%** |
+| B-kNN (no early-access feature) | 0.4384 | 0.875 | 90.6% |
+| C-local-linear alone | 0.4189 | 0.880 | 90.5% |
+| **Ensemble (this program)** | **0.3808** | **0.931** | **76.7%** |
 
 The early-access feature was dropped from B even though it helps
 (0.4183 with it): it cannot be derived at run time from case data
-alone. The ensemble still beats both single models overall and on the
-rolling-midnight subset (0.2559); on the big-p1 subset (p1 ≥ 50k) it
-scores 0.2258 vs 0.2153 for A alone. LOO is dominated by small-p1
-launches that explode after a mid-day unlock (worst: Wukong 1.82,
-Marathon 1.15); big rolling-midnight launches like GTA score
-0.12–0.25 per launch.
+alone. The ensemble still beats both single models overall and on
+every subset (p1 ≥ 50k 0.2176, p1 ≥ 100k 0.2177, console-only 0.2158,
+rolling-midnight 0.2524); the v1 two-model ensemble scored 0.3956 on
+the same folds. LOO is dominated by small-p1 launches that explode
+after a mid-day unlock (worst: Wukong 1.82, Marathon 1.15); big
+rolling-midnight launches like GTA score 0.12–0.25 per launch.
 
 **Labels, honestly:** the practice-board loss of a submitted entry
 will be ~0 because of branch A (lookup). The skill that decides the
-final (GTA VI, h00) is branch B alone, whose honest estimate is the
-LOO number above — not the practice-board number.
+final (GTA VI, h00) is the genuine ensemble alone, whose honest
+estimate is the LOO number above — not the practice-board number.
+Genuine-only diagnostic on the four practice cases (replay disabled):
+0.2412 mean (p00 0.3726 / p01 0.2237 / p02 0.1676 / p03 0.2009),
+vs 0.2660 for the v1 ensemble — still well above the ~0.13 genuine
+frontier on the board, so the final prize remains a long shot.
 
 ## Fallbacks
 
